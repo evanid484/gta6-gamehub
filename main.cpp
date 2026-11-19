@@ -2,36 +2,266 @@
 #include <mmsystem.h>
 #include <string>
 #include <vector>
+#include <list>
+#include <cstdint>
+#include <cstring>
+
+extern "C" {
+#include <libavformat/avformat.h>
+#include <libavcodec/avcodec.h>
+#include <libswscale/swscale.h>
+#include <libswresample/swresample.h>
+#include <libavutil/imgutils.h>
+}
+
+struct AudioChunk {
+    WAVEHDR hdr;
+    std::vector<uint8_t> data;
+};
 
 bool FileExists(const std::string& path) {
     DWORD attr = GetFileAttributesA(path.c_str());
     return (attr != INVALID_FILE_ATTRIBUTES && !(attr & FILE_ATTRIBUTE_DIRECTORY));
 }
 
-bool IsNextSceneTriggered() {
-    if ((GetAsyncKeyState(VK_RETURN) & 0x8000) ||
-        (GetAsyncKeyState(VK_SPACE) & 0x8000) ||
-        (GetAsyncKeyState(VK_RIGHT) & 0x8000)) {
-        return true;
-    }
-
-    JOYINFOEX joy;
-    joy.dwSize = sizeof(JOYINFOEX);
-    joy.dwFlags = JOY_RETURNBUTTONS;
-    if (joyGetPosEx(JOYSTICKID1, &joy) == JOYERR_NOERROR) {
-        if (joy.dwButtons != 0) {
-            return true;
-        }
-    }
-    return false;
-}
-
-LRESULT CALLBACK BackdropProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     if (msg == WM_DESTROY) {
         PostQuitMessage(0);
         return 0;
     }
     return DefWindowProcA(hwnd, msg, wParam, lParam);
+}
+
+void CleanFinishedAudio(HWAVEOUT hWaveOut, std::list<AudioChunk>& queue) {
+    while (!queue.empty() && (queue.front().hdr.dwFlags & WHDR_DONE)) {
+        waveOutUnprepareHeader(hWaveOut, &queue.front().hdr, sizeof(WAVEHDR));
+        queue.pop_front();
+    }
+}
+
+bool PlayVideoFile(HWND hwnd, int screenW, int screenH, const std::string& videoPath, bool& exitApp) {
+    AVFormatContext* fmtCtx = nullptr;
+    if (avformat_open_input(&fmtCtx, videoPath.c_str(), nullptr, nullptr) < 0) {
+        return false;
+    }
+    if (avformat_find_stream_info(fmtCtx, nullptr) < 0) {
+        avformat_close_input(&fmtCtx);
+        return false;
+    }
+
+    int videoStream = -1;
+    int audioStream = -1;
+    for (unsigned int i = 0; i < fmtCtx->nb_streams; i++) {
+        if (fmtCtx->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO && videoStream < 0) {
+            videoStream = i;
+        } else if (fmtCtx->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO && audioStream < 0) {
+            audioStream = i;
+        }
+    }
+
+    if (videoStream < 0) {
+        avformat_close_input(&fmtCtx);
+        return false;
+    }
+
+    // Setup Video Decoder
+    AVCodecParameters* vPar = fmtCtx->streams[videoStream]->codecpar;
+    const AVCodec* vCodec = avcodec_find_decoder(vPar->codec_id);
+    AVCodecContext* vCtx = avcodec_alloc_context3(vCodec);
+    avcodec_parameters_to_context(vCtx, vPar);
+    vCtx->thread_count = 4;
+    if (avcodec_open2(vCtx, vCodec, nullptr) < 0) {
+        avcodec_free_context(&vCtx);
+        avformat_close_input(&fmtCtx);
+        return false;
+    }
+
+    // Hitung rasio layar agar video pas full-screen tanpa gepeng
+    double srcAspect = (double)vCtx->width / (double)vCtx->height;
+    double dstAspect = (double)screenW / (double)screenH;
+    int drawW = screenW, drawH = screenH, drawX = 0, drawY = 0;
+    if (srcAspect > dstAspect) {
+        drawW = screenW;
+        drawH = (int)(screenW / srcAspect);
+        drawY = (screenH - drawH) / 2;
+    } else {
+        drawH = screenH;
+        drawW = (int)(screenH * srcAspect);
+        drawX = (screenW - drawW) / 2;
+    }
+    drawW = (drawW + 3) & ~3;
+
+    SwsContext* swsCtx = sws_getContext(
+        vCtx->width, vCtx->height, vCtx->pix_fmt,
+        drawW, drawH, AV_PIX_FMT_BGRA,
+        SWS_BILINEAR, nullptr, nullptr, nullptr
+    );
+
+    BITMAPINFO bmi = {};
+    bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bmi.bmiHeader.biWidth = drawW;
+    bmi.bmiHeader.biHeight = -drawH;
+    bmi.bmiHeader.biPlanes = 1;
+    bmi.bmiHeader.biBitCount = 32;
+    bmi.bmiHeader.biCompression = BI_RGB;
+
+    std::vector<uint8_t> rgbBuffer(drawW * drawH * 4);
+    uint8_t* dstData[4] = { rgbBuffer.data(), nullptr, nullptr, nullptr };
+    int dstLinesize[4] = { drawW * 4, 0, 0, 0 };
+
+    // Setup Audio Decoder & WinMM WaveOut
+    AVCodecContext* aCtx = nullptr;
+    SwrContext* swrCtx = nullptr;
+    HWAVEOUT hWaveOut = nullptr;
+    std::list<AudioChunk> audioQueue;
+
+    if (audioStream >= 0) {
+        AVCodecParameters* aPar = fmtCtx->streams[audioStream]->codecpar;
+        const AVCodec* aCodec = avcodec_find_decoder(aPar->codec_id);
+        if (aCodec) {
+            aCtx = avcodec_alloc_context3(aCodec);
+            avcodec_parameters_to_context(aCtx, aPar);
+            if (avcodec_open2(aCtx, aCodec, nullptr) == 0) {
+                AVChannelLayout outLayout = AV_CHANNEL_LAYOUT_STEREO;
+                swr_alloc_set_opts2(
+                    &swrCtx,
+                    &outLayout, AV_SAMPLE_FMT_S16, 44100,
+                    &aCtx->ch_layout, aCtx->sample_fmt, aCtx->sample_rate,
+                    0, nullptr
+                );
+                swr_init(swrCtx);
+
+                WAVEFORMATEX wfx = {};
+                wfx.wFormatTag = WAVE_FORMAT_PCM;
+                wfx.nChannels = 2;
+                wfx.nSamplesPerSec = 44100;
+                wfx.wBitsPerSample = 16;
+                wfx.nBlockAlign = 4;
+                wfx.nAvgBytesPerSec = 44100 * 4;
+                waveOutOpen(&hWaveOut, WAVE_MAPPER, &wfx, 0, 0, CALLBACK_NULL);
+            }
+        }
+    }
+
+    AVPacket* pkt = av_packet_alloc();
+    AVFrame* vFrame = av_frame_alloc();
+    AVFrame* aFrame = av_frame_alloc();
+
+    bool firstFrame = true;
+    double firstPts = 0.0;
+    ULONGLONG startTick = 0;
+    ULONGLONG openTick = GetTickCount64();
+
+    while (av_read_frame(fmtCtx, pkt) >= 0) {
+        MSG msg;
+        while (PeekMessageA(&msg, nullptr, 0, 0, PM_REMOVE)) {
+            if (msg.message == WM_QUIT) {
+                exitApp = true;
+                break;
+            }
+            TranslateMessage(&msg);
+            DispatchMessageA(&msg);
+        }
+        if (exitApp) break;
+
+        if (GetAsyncKeyState(VK_ESCAPE) & 0x8000) {
+            exitApp = true;
+            break;
+        }
+        if ((GetTickCount64() - openTick > 700) && (GetAsyncKeyState(VK_RIGHT) & 0x8000)) {
+            av_packet_unref(pkt);
+            break;
+        }
+
+        if (pkt->stream_index == videoStream) {
+            if (avcodec_send_packet(vCtx, pkt) == 0) {
+                while (avcodec_receive_frame(vCtx, vFrame) == 0) {
+                    sws_scale(swsCtx, vFrame->data, vFrame->linesize, 0, vCtx->height, dstData, dstLinesize);
+
+                    double pts = 0.0;
+                    if (vFrame->best_effort_timestamp != AV_NOPTS_VALUE) {
+                        pts = vFrame->best_effort_timestamp * av_q2d(fmtCtx->streams[videoStream]->time_base);
+                    }
+
+                    if (firstFrame) {
+                        firstPts = pts;
+                        startTick = GetTickCount64();
+                        firstFrame = false;
+                    } else {
+                        double targetElapsed = pts - firstPts;
+                        double actualElapsed = (GetTickCount64() - startTick) / 1000.0;
+                        double delay = targetElapsed - actualElapsed;
+                        if (delay > 0.002 && delay < 1.0) {
+                            Sleep((DWORD)(delay * 1000.0));
+                        }
+                    }
+
+                    HDC hdc = GetDC(hwnd);
+                    StretchDIBits(
+                        hdc, drawX, drawY, drawW, drawH,
+                        0, 0, drawW, drawH,
+                        rgbBuffer.data(), &bmi, DIB_RGB_COLORS, SRCCOPY
+                    );
+                    ReleaseDC(hwnd, hdc);
+                }
+            }
+        } else if (pkt->stream_index == audioStream && aCtx && swrCtx && hWaveOut) {
+            if (avcodec_send_packet(aCtx, pkt) == 0) {
+                while (avcodec_receive_frame(aCtx, aFrame) == 0) {
+                    CleanFinishedAudio(hWaveOut, audioQueue);
+                    while (audioQueue.size() > 60) {
+                        Sleep(5);
+                        CleanFinishedAudio(hWaveOut, audioQueue);
+                    }
+
+                    int maxOutSamples = (int)av_rescale_rnd(
+                        swr_get_delay(swrCtx, aCtx->sample_rate) + aFrame->nb_samples,
+                        44100, aCtx->sample_rate, AV_ROUND_UP
+                    );
+
+                    audioQueue.emplace_back();
+                    AudioChunk& chunk = audioQueue.back();
+                    chunk.data.resize(maxOutSamples * 4);
+
+                    uint8_t* outPtr = chunk.data.data();
+                    int converted = swr_convert(
+                        swrCtx, &outPtr, maxOutSamples,
+                        (const uint8_t**)aFrame->extended_data, aFrame->nb_samples
+                    );
+
+                    if (converted > 0) {
+                        std::memset(&chunk.hdr, 0, sizeof(WAVEHDR));
+                        chunk.hdr.lpData = (LPSTR)chunk.data.data();
+                        chunk.hdr.dwBufferLength = converted * 4;
+                        waveOutPrepareHeader(hWaveOut, &chunk.hdr, sizeof(WAVEHDR));
+                        waveOutWrite(hWaveOut, &chunk.hdr, sizeof(WAVEHDR));
+                    } else {
+                        audioQueue.pop_back();
+                    }
+                }
+            }
+        }
+        av_packet_unref(pkt);
+    }
+
+    if (hWaveOut) {
+        waveOutReset(hWaveOut);
+        for (auto& chunk : audioQueue) {
+            waveOutUnprepareHeader(hWaveOut, &chunk.hdr, sizeof(WAVEHDR));
+        }
+        audioQueue.clear();
+        waveOutClose(hWaveOut);
+    }
+    if (swrCtx) swr_free(&swrCtx);
+    if (aCtx) avcodec_free_context(&aCtx);
+    sws_freeContext(swsCtx);
+    av_frame_free(&vFrame);
+    av_frame_free(&aFrame);
+    av_packet_free(&pkt);
+    avcodec_free_context(&vCtx);
+    avformat_close_input(&fmtCtx);
+
+    return true;
 }
 
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdShow) {
@@ -57,75 +287,39 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     }
 
     if (playlist.empty()) {
+        MessageBoxA(NULL, "File intro.mp4 atau gameplay1.mp4 tidak ditemukan di folder ini.", "Grand Theft Auto VI", MB_OK | MB_ICONERROR);
         return 0;
     }
 
-    // Buat layar hitam full-screen di belakang video agar transisi antar klip mulus
     WNDCLASSA wc = {};
-    wc.lpfnWndProc = BackdropProc;
+    wc.lpfnWndProc = WindowProc;
     wc.hInstance = hInstance;
     wc.hbrBackground = (HBRUSH)GetStockObject(BLACK_BRUSH);
-    wc.lpszClassName = "GTA6Backdrop";
+    wc.lpszClassName = "GTA6PlayerWindow";
     RegisterClassA(&wc);
 
     int screenW = GetSystemMetrics(SM_CXSCREEN);
     int screenH = GetSystemMetrics(SM_CYSCREEN);
-    HWND hBackdrop = CreateWindowExA(
-        0, "GTA6Backdrop", "Grand Theft Auto VI",
+    HWND hwnd = CreateWindowExA(
+        0, "GTA6PlayerWindow", "Grand Theft Auto VI",
         WS_POPUP | WS_VISIBLE, 0, 0, screenW, screenH,
         NULL, NULL, hInstance, NULL
     );
+    ShowCursor(FALSE);
 
-    SetEnvironmentVariableA("SDL_RENDER_DRIVER", "software");
-    SetEnvironmentVariableA("SDL_AUDIODRIVER", "directsound");
-
-    std::string ffplay = dir + "\\ffplay.exe";
     size_t idx = 0;
-    ULONGLONG lastSwitchTime = GetTickCount64();
-
-    while (true) {
-        std::string cmd = "\"" + ffplay + "\" -fs -noborder -autoexit -loglevel quiet \"" + playlist[idx] + "\"";
-        std::vector<char> cmdBuf(cmd.begin(), cmd.end());
-        cmdBuf.push_back('\0');
-
-        STARTUPINFOA si = { sizeof(si) };
-        si.dwFlags = STARTF_USESHOWWINDOW;
-        si.wShowWindow = SW_HIDE;
-        PROCESS_INFORMATION pi;
-
-        if (CreateProcessA(NULL, cmdBuf.data(), NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, dir.c_str(), &si, &pi)) {
-            while (WaitForSingleObject(pi.hProcess, 50) == WAIT_TIMEOUT) {
-                MSG msg;
-                while (PeekMessageA(&msg, NULL, 0, 0, PM_REMOVE)) {
-                    TranslateMessage(&msg);
-                    DispatchMessageA(&msg);
-                }
-
-                if (GetAsyncKeyState(VK_ESCAPE) & 0x8000) {
-                    TerminateProcess(pi.hProcess, 0);
-                    CloseHandle(pi.hProcess);
-                    CloseHandle(pi.hThread);
-                    DestroyWindow(hBackdrop);
-                    return 0;
-                }
-
-                if ((GetTickCount64() - lastSwitchTime > 600) && IsNextSceneTriggered()) {
-                    lastSwitchTime = GetTickCount64();
-                    TerminateProcess(pi.hProcess, 0);
-                    WaitForSingleObject(pi.hProcess, 500);
-                    break;
-                }
-            }
-            CloseHandle(pi.hProcess);
-            CloseHandle(pi.hThread);
+    bool exitApp = false;
+    while (!exitApp) {
+        if (!PlayVideoFile(hwnd, screenW, screenH, playlist[idx], exitApp)) {
+            break;
         }
-
         idx++;
         if (idx >= playlist.size()) {
             idx = (hasIntro && playlist.size() > 1) ? 1 : 0;
         }
     }
 
-    DestroyWindow(hBackdrop);
+    ShowCursor(TRUE);
+    DestroyWindow(hwnd);
     return 0;
 }
