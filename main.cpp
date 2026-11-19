@@ -1,5 +1,6 @@
 #include <windows.h>
 #include <mmsystem.h>
+#include <dsound.h>
 #include <string>
 #include <vector>
 #include <list>
@@ -13,6 +14,8 @@ extern "C" {
 #include <libswresample/swresample.h>
 #include <libavutil/imgutils.h>
 }
+
+typedef HRESULT (WINAPI *PFN_DirectSoundCreate)(LPCGUID, LPDIRECTSOUND*, LPUNKNOWN);
 
 struct AudioChunk {
     WAVEHDR hdr;
@@ -76,7 +79,6 @@ bool PlayVideoFile(HWND hwnd, int screenW, int screenH, const std::string& video
         return false;
     }
 
-    // Hitung rasio layar agar video pas full-screen tanpa gepeng
     double srcAspect = (double)vCtx->width / (double)vCtx->height;
     double dstAspect = (double)screenW / (double)screenH;
     int drawW = screenW, drawH = screenH, drawX = 0, drawY = 0;
@@ -109,9 +111,16 @@ bool PlayVideoFile(HWND hwnd, int screenW, int screenH, const std::string& video
     uint8_t* dstData[4] = { rgbBuffer.data(), nullptr, nullptr, nullptr };
     int dstLinesize[4] = { drawW * 4, 0, 0, 0 };
 
-    // Setup Audio Decoder & WinMM WaveOut
+    // Setup Audio Decoder (DirectSound GlobalFocus 48kHz + WaveOut Fallback)
     AVCodecContext* aCtx = nullptr;
     SwrContext* swrCtx = nullptr;
+    HMODULE hDsound = nullptr;
+    LPDIRECTSOUND pDS = nullptr;
+    LPDIRECTSOUNDBUFFER pDSBuf = nullptr;
+    const DWORD DS_BUF_SIZE = 48000 * 4 * 2; // 2 detik ring buffer
+    DWORD dsWriteOffset = 0;
+    bool dsStarted = false;
+
     HWAVEOUT hWaveOut = nullptr;
     std::list<AudioChunk> audioQueue;
 
@@ -122,23 +131,60 @@ bool PlayVideoFile(HWND hwnd, int screenW, int screenH, const std::string& video
             aCtx = avcodec_alloc_context3(aCodec);
             avcodec_parameters_to_context(aCtx, aPar);
             if (avcodec_open2(aCtx, aCodec, nullptr) == 0) {
-                AVChannelLayout outLayout = AV_CHANNEL_LAYOUT_STEREO;
-                swr_alloc_set_opts2(
-                    &swrCtx,
-                    &outLayout, AV_SAMPLE_FMT_S16, 44100,
-                    &aCtx->ch_layout, aCtx->sample_fmt, aCtx->sample_rate,
-                    0, nullptr
-                );
-                swr_init(swrCtx);
+                AVChannelLayout inLayout = aCtx->ch_layout;
+                if (inLayout.order == AV_CHANNEL_ORDER_UNSPEC) {
+                    int ch = inLayout.nb_channels > 0 ? inLayout.nb_channels : 2;
+                    av_channel_layout_default(&inLayout, ch);
+                }
 
-                WAVEFORMATEX wfx = {};
-                wfx.wFormatTag = WAVE_FORMAT_PCM;
-                wfx.nChannels = 2;
-                wfx.nSamplesPerSec = 44100;
-                wfx.wBitsPerSample = 16;
-                wfx.nBlockAlign = 4;
-                wfx.nAvgBytesPerSec = 44100 * 4;
-                waveOutOpen(&hWaveOut, WAVE_MAPPER, &wfx, 0, 0, CALLBACK_NULL);
+                AVChannelLayout outLayout = AV_CHANNEL_LAYOUT_STEREO;
+                if (swr_alloc_set_opts2(
+                        &swrCtx,
+                        &outLayout, AV_SAMPLE_FMT_S16, 48000,
+                        &inLayout, aCtx->sample_fmt, aCtx->sample_rate,
+                        0, nullptr) >= 0 && swr_init(swrCtx) >= 0) {
+
+                    WAVEFORMATEX wfx = {};
+                    wfx.wFormatTag = WAVE_FORMAT_PCM;
+                    wfx.nChannels = 2;
+                    wfx.nSamplesPerSec = 48000;
+                    wfx.wBitsPerSample = 16;
+                    wfx.nBlockAlign = 4;
+                    wfx.nAvgBytesPerSec = 48000 * 4;
+
+                    // Coba DirectSound dulu (paling stabil di GameHub/Wine)
+                    hDsound = LoadLibraryA("dsound.dll");
+                    if (hDsound) {
+                        auto pDirectSoundCreate = (PFN_DirectSoundCreate)GetProcAddress(hDsound, "DirectSoundCreate");
+                        if (pDirectSoundCreate && SUCCEEDED(pDirectSoundCreate(NULL, &pDS, NULL))) {
+                            pDS->SetCooperativeLevel(hwnd, DSSCL_PRIORITY);
+
+                            DSBUFFERDESC primDesc = {};
+                            primDesc.dwSize = sizeof(DSBUFFERDESC);
+                            primDesc.dwFlags = DSBCAPS_PRIMARYBUFFER;
+                            LPDIRECTSOUNDBUFFER pPrimary = nullptr;
+                            if (SUCCEEDED(pDS->CreateSoundBuffer(&primDesc, &pPrimary, NULL))) {
+                                pPrimary->SetFormat(&wfx);
+                                pPrimary->Release();
+                            }
+
+                            DSBUFFERDESC secDesc = {};
+                            secDesc.dwSize = sizeof(DSBUFFERDESC);
+                            secDesc.dwFlags = DSBCAPS_GLOBALFOCUS | DSBCAPS_GETCURRENTPOSITION2;
+                            secDesc.dwBufferBytes = DS_BUF_SIZE;
+                            secDesc.lpwfxFormat = &wfx;
+                            if (FAILED(pDS->CreateSoundBuffer(&secDesc, &pDSBuf, NULL))) {
+                                pDS->Release();
+                                pDS = nullptr;
+                            }
+                        }
+                    }
+
+                    // Fallback ke WaveOut jika DirectSound tidak tersedia
+                    if (!pDSBuf) {
+                        waveOutOpen(&hWaveOut, WAVE_MAPPER, &wfx, 0, 0, CALLBACK_NULL);
+                    }
+                }
             }
         }
     }
@@ -205,44 +251,81 @@ bool PlayVideoFile(HWND hwnd, int screenW, int screenH, const std::string& video
                     ReleaseDC(hwnd, hdc);
                 }
             }
-        } else if (pkt->stream_index == audioStream && aCtx && swrCtx && hWaveOut) {
+        } else if (pkt->stream_index == audioStream && aCtx && swrCtx && (pDSBuf || hWaveOut)) {
             if (avcodec_send_packet(aCtx, pkt) == 0) {
                 while (avcodec_receive_frame(aCtx, aFrame) == 0) {
-                    CleanFinishedAudio(hWaveOut, audioQueue);
-                    while (audioQueue.size() > 60) {
-                        Sleep(5);
-                        CleanFinishedAudio(hWaveOut, audioQueue);
-                    }
-
                     int maxOutSamples = (int)av_rescale_rnd(
                         swr_get_delay(swrCtx, aCtx->sample_rate) + aFrame->nb_samples,
-                        44100, aCtx->sample_rate, AV_ROUND_UP
+                        48000, aCtx->sample_rate, AV_ROUND_UP
                     );
 
-                    audioQueue.emplace_back();
-                    AudioChunk& chunk = audioQueue.back();
-                    chunk.data.resize(maxOutSamples * 4);
-
-                    uint8_t* outPtr = chunk.data.data();
+                    std::vector<uint8_t> pcmBuf(maxOutSamples * 4);
+                    uint8_t* outPtr = pcmBuf.data();
                     int converted = swr_convert(
                         swrCtx, &outPtr, maxOutSamples,
                         (const uint8_t**)aFrame->extended_data, aFrame->nb_samples
                     );
 
                     if (converted > 0) {
-                        std::memset(&chunk.hdr, 0, sizeof(WAVEHDR));
-                        chunk.hdr.lpData = (LPSTR)chunk.data.data();
-                        chunk.hdr.dwBufferLength = converted * 4;
-                        waveOutPrepareHeader(hWaveOut, &chunk.hdr, sizeof(WAVEHDR));
-                        waveOutWrite(hWaveOut, &chunk.hdr, sizeof(WAVEHDR));
-                    } else {
-                        audioQueue.pop_back();
+                        DWORD pcmBytes = (DWORD)(converted * 4);
+
+                        if (pDSBuf) {
+                            if (dsStarted) {
+                                while (!exitApp) {
+                                    DWORD playCursor = 0, writeCursor = 0;
+                                    if (FAILED(pDSBuf->GetCurrentPosition(&playCursor, &writeCursor))) break;
+                                    DWORD queued = (dsWriteOffset >= playCursor)
+                                        ? (dsWriteOffset - playCursor)
+                                        : (DS_BUF_SIZE - playCursor + dsWriteOffset);
+                                    if (queued + pcmBytes < DS_BUF_SIZE - 4096) break;
+                                    Sleep(5);
+                                }
+                            }
+
+                            void *ptr1 = nullptr, *ptr2 = nullptr;
+                            DWORD bytes1 = 0, bytes2 = 0;
+                            if (SUCCEEDED(pDSBuf->Lock(dsWriteOffset, pcmBytes, &ptr1, &bytes1, &ptr2, &bytes2, 0))) {
+                                std::memcpy(ptr1, pcmBuf.data(), bytes1);
+                                if (ptr2 && bytes2 > 0) {
+                                    std::memcpy(ptr2, pcmBuf.data() + bytes1, bytes2);
+                                }
+                                pDSBuf->Unlock(ptr1, bytes1, ptr2, bytes2);
+                                dsWriteOffset = (dsWriteOffset + pcmBytes) % DS_BUF_SIZE;
+
+                                if (!dsStarted && dsWriteOffset >= 48000) {
+                                    pDSBuf->Play(0, 0, DSBPLAY_LOOPING);
+                                    dsStarted = true;
+                                }
+                            }
+                        } else if (hWaveOut) {
+                            CleanFinishedAudio(hWaveOut, audioQueue);
+                            while (audioQueue.size() > 60) {
+                                Sleep(5);
+                                CleanFinishedAudio(hWaveOut, audioQueue);
+                            }
+
+                            audioQueue.emplace_back();
+                            AudioChunk& chunk = audioQueue.back();
+                            chunk.data.assign(pcmBuf.begin(), pcmBuf.begin() + pcmBytes);
+                            std::memset(&chunk.hdr, 0, sizeof(WAVEHDR));
+                            chunk.hdr.lpData = (LPSTR)chunk.data.data();
+                            chunk.hdr.dwBufferLength = pcmBytes;
+                            waveOutPrepareHeader(hWaveOut, &chunk.hdr, sizeof(WAVEHDR));
+                            waveOutWrite(hWaveOut, &chunk.hdr, sizeof(WAVEHDR));
+                        }
                     }
                 }
             }
         }
         av_packet_unref(pkt);
     }
+
+    if (pDSBuf) {
+        pDSBuf->Stop();
+        pDSBuf->Release();
+    }
+    if (pDS) pDS->Release();
+    if (hDsound) FreeLibrary(hDsound);
 
     if (hWaveOut) {
         waveOutReset(hWaveOut);
