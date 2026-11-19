@@ -14,21 +14,25 @@ jobs:
       - name: Install MinGW & Tools
         run: sudo apt-get update && sudo apt-get install -y mingw-w64 unzip curl
 
+      - name: Download FFmpeg Libraries
+        run: |
+          curl -fL "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl-shared.zip" -o ffmpeg.zip
+          unzip -q ffmpeg.zip -d ffmpeg_sdk
+          SDK_DIR=$(find ffmpeg_sdk -maxdepth 1 -mindepth 1 -type d | head -n 1)
+          mkdir -p dist
+          cp "$SDK_DIR"/bin/*.dll dist/
+          echo "SDK_DIR=$SDK_DIR" >> $GITHUB_ENV
+
       - name: Compile GTA6.exe
         run: |
-          mkdir -p dist
+          FLAGS="-I$SDK_DIR/include -L$SDK_DIR/lib -lavformat -lavcodec -lswscale -lswresample -lavutil -lwinmm -lgdi32 -mwindows -O2 -static-libgcc -static-libstdc++"
           if [ -f "gta6.ico" ]; then
             echo '1 ICON "gta6.ico"' > resource.rc
             x86_64-w64-mingw32-windres resource.rc -O coff -o resource.res
-            x86_64-w64-mingw32-g++ main.cpp resource.res -o dist/GTA6.exe -mwindows -lwinmm -O2 -static
+            x86_64-w64-mingw32-g++ main.cpp resource.res -o dist/GTA6.exe $FLAGS
           else
-            x86_64-w64-mingw32-g++ main.cpp -o dist/GTA6.exe -mwindows -lwinmm -O2 -static
+            x86_64-w64-mingw32-g++ main.cpp -o dist/GTA6.exe $FLAGS
           fi
-
-      - name: Download ffplay.exe
-        run: |
-          curl -fL "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip" -o ffmpeg.zip
-          unzip -j ffmpeg.zip "*/bin/ffplay.exe" -d dist/
 
       - name: Upload Ready-to-Use Package
         uses: actions/upload-artifact@v4
