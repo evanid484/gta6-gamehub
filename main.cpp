@@ -8,6 +8,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     std::string dir(exePath);
     dir = dir.substr(0, dir.find_last_of("\\/"));
 
+    // Paksa SDL2 memakai software renderer & directsound agar stabil di Wine/GameHub
+    SetEnvironmentVariableA("SDL_RENDER_DRIVER", "software");
+    SetEnvironmentVariableA("SDL_AUDIODRIVER", "directsound");
+
     std::string ffplay = dir + "\\ffplay.exe";
     std::string video = dir + "\\intro.mp4";
     std::string cmd = "\"" + ffplay + "\" -fs -noborder -autoexit -loglevel quiet \"" + video + "\"";
