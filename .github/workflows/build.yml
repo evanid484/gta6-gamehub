@@ -25,10 +25,11 @@ jobs:
             x86_64-w64-mingw32-g++ main.cpp -o dist/GTA6.exe -mwindows -O2 -static
           fi
 
-      - name: Download ffplay.exe
+      - name: Download Official ffplay.exe
         run: |
-          curl -L "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip" -o ffmpeg.zip
+          curl -fL "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip" -o ffmpeg.zip
           unzip -j ffmpeg.zip "*/bin/ffplay.exe" -d dist/
+          ls -lh dist/
 
       - name: Upload Ready-to-Use Package
         uses: actions/upload-artifact@v4
